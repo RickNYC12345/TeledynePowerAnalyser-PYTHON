@@ -1,0 +1,259 @@
+import serial
+import time
+import csv
+import os
+
+# --- Configuration ---
+port = "COM3"
+baud_rate = 115200
+integration_interval_seconds = 10 # <<< SET YOUR DESIRED INTEGRATION TIME HERE (seconds)
+output_csv_file = f"power_data_integrated_{integration_interval_seconds}s.csv" # Dynamic filename
+
+# --- Initialize Serial Connection Variable ---
+ser = None
+
+# --- Helper function to convert seconds to H,M,S for timer command ---
+def seconds_to_hms(seconds):
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    # Clamp hours to max 9999 per SCPI spec
+    h = min(h, 9999)
+    return int(h), int(m), int(s)
+
+# --- Connect and Configure Instrument ---
+try:
+    print(f"Attempting to connect to {port} at {baud_rate} baud...")
+    ser = serial.Serial(port, baud_rate, timeout=2) # Slightly longer timeout for polling state
+    print(f"Connected successfully to {port}.")
+
+    # Send *IDN? to verify connection (Standard queries often uppercase)
+    ser.write("*IDN?\n".encode())
+    time.sleep(0.2)
+    idn_response = ser.readline().decode().strip()
+    if idn_response:
+        print(f"Instrument ID: {idn_response}")
+    else:
+        print("Warning: No response to *IDN?. Check connection/instrument state.")
+        raise Exception("Failed to get IDN response")
+
+    # --- Configure Integration Settings ---
+    print("\nConfiguring Integration Settings...")
+    # Mode = STANdard (Timed) - Set command (mixed case)
+    ser.write(":INTegrate:MODE STANdard\n".encode())
+    time.sleep(0.2)
+    # Function = WATT (for Watt-hours) - Set command (mixed case)
+    ser.write(":INTegrate:FUNCtion WATT\n".encode())
+    time.sleep(0.2)
+    # Timer Interval - Set command (mixed case)
+    h, m, s = seconds_to_hms(integration_interval_seconds)
+    timer_cmd = f":INTegrate:TIMer {h},{m},{s}\n"
+    print(f"Setting integration timer to {h}h {m}m {s}s ({integration_interval_seconds} seconds)")
+    ser.write(timer_cmd.encode())
+    time.sleep(0.2)
+
+    # Optional: Query settings to confirm (Query commands ALL CAPS)
+    ser.write(":INTEGRATE:MODE?\n".encode())
+    time.sleep(0.1)
+    print(f"Confirm Mode: {ser.readline().decode().strip()}")
+    ser.write(":INTEGRATE:FUNCTION?\n".encode())
+    time.sleep(0.1)
+    print(f"Confirm Function: {ser.readline().decode().strip()}")
+    ser.write(":INTEGRATE:TIMER?\n".encode())
+    time.sleep(0.1)
+    print(f"Confirm Timer: {ser.readline().decode().strip()}")
+
+
+    # --- Configure Numeric Items ---
+    # Item 1=UPPeak, Item 2=I, Item 3=P (instantaneous), Item 4=WH (integrated Watt-Hours)
+    # Set commands (mixed case)
+    print("\nConfiguring Numeric Items (1:Vpk, 2:I, 3:P_inst, 4:WH_int)...")
+    ser.write(":NUMeric:NORMal:ITEM1 UPPeak\n".encode())
+    time.sleep(0.2)
+    ser.write(":NUMeric:NORMal:ITEM2 I\n".encode())
+    time.sleep(0.2)
+    ser.write(":NUMeric:NORMal:ITEM3 P\n".encode()) # Keep instantaneous P as item 3
+    time.sleep(0.2)
+    ser.write(":NUMeric:NORMal:ITEM4 WH\n".encode()) # Add total Watt-Hours as item 4
+    time.sleep(0.2)
+
+    # Set number of items to return to 4 - Set command (mixed case)
+    ser.write(":NUMeric:NORMal:NUMBer 4\n".encode())
+    time.sleep(0.2)
+    # Confirm number of items - Query command (ALL CAPS)
+    ser.write(":NUMERIC:NORMAL:NUMBER?\n".encode())
+    time.sleep(0.1)
+    print(f"Confirm Number of Items: {ser.readline().decode().strip()}")
+
+    # --- Disable Averaging (Optional - focus on Integration) ---
+    # print("\nSetting instantaneous averaging count to 1 (disabling averaging)")
+    # ser.write(":MEASure:AVERaging:COUNt 1\n".encode()) # Set command (mixed case)
+    # time.sleep(0.2)
+    # ser.write(":MEASURE:AVERAGING:COUNT?\n".encode()) # Query command (ALL CAPS)
+    # time.sleep(0.1)
+    # print(f"Confirm Averaging Count: {ser.readline().decode().strip()}")
+
+
+except serial.SerialException as e:
+    print(f"Fatal Error: Serial communication error during configuration: {e}")
+    if ser and ser.is_open:
+        ser.close()
+    exit() # Exit if configuration fails
+except Exception as e:
+    print(f"Fatal Error: An unexpected error occurred during configuration: {e}")
+    if ser and ser.is_open:
+        ser.close()
+    exit() # Exit if configuration fails
+
+
+# --- Measurement Loop using Integration ---
+print(f"\nStarting Integration Loop. Interval: {integration_interval_seconds}s. Logging to '{output_csv_file}'...")
+
+try:
+    with open(output_csv_file, "a", newline='') as csvfile:
+        writer = csv.writer(csvfile)
+
+        file_is_empty = os.path.getsize(output_csv_file) == 0 if os.path.exists(output_csv_file) else True
+
+        if file_is_empty:
+            print("CSV file is new or empty. Writing header.")
+            # --- UPDATED CSV HEADER ---
+            writer.writerow([
+                "Timestamp",
+                "Interval Avg Power (W)",
+                "Interval WattHours (Wh)",
+                "End Interval V+pk (V)",
+                "End Interval Current (A)",
+                "End Interval Inst Power (W)"
+            ])
+            csvfile.flush()
+
+        loop_count = 0
+        while True:
+            loop_count += 1
+            print(f"\n--- Starting Integration Cycle {loop_count} ---")
+            integration_start_time = time.time()
+
+            try:
+                # 1. Reset Integrator - Set command (mixed case)
+                print("Resetting integrator...")
+                ser.write(":INTegrate:RESet\n".encode())
+                time.sleep(0.3) # Give it a moment to reset
+
+                # 2. Start Integrator - Set command (mixed case)
+                print("Starting integrator...")
+                ser.write(":INTegrate:STARt\n".encode())
+                time.sleep(0.1) # Small delay after start
+
+                # 3. Wait for Integration to complete by polling state
+                print(f"Integrating for {integration_interval_seconds} seconds...")
+                while True:
+                    # Query command (ALL CAPS)
+                    ser.write(":INTEGRATE:STATE?\n".encode())
+                    state_response = ser.readline().decode().strip().upper() # Read and convert to upper case
+                    # print(f"  Current state: {state_response}") # Uncomment for debugging state
+
+                    if "TIMEUP" in state_response:
+                        print("Integration complete (TIMEUP).")
+                        break
+                    elif "RUNNING" in state_response:
+                        time.sleep(0.5) # Poll state every 0.5 seconds
+                    elif "STOP" in state_response or "RESET" in state_response:
+                        print(f"Warning: Integration stopped unexpectedly. State: {state_response}")
+                        raise Exception(f"Integration stopped unexpectedly: {state_response}")
+                    elif "OVERFLOW" in state_response:
+                         print(f"Warning: Integration overflow detected. State: {state_response}")
+                         raise Exception(f"Integration overflow: {state_response}")
+                    elif not state_response:
+                        print("Warning: No response received for STATE query. Retrying...")
+                        time.sleep(0.5)
+                    else:
+                        print(f"Warning: Unexpected integration state received: {state_response}. Waiting...")
+                        time.sleep(0.5)
+
+                    # Timeout check
+                    if time.time() - integration_start_time > integration_interval_seconds * 1.5:
+                         raise TimeoutError("Integration polling timed out waiting for TIMEUP state.")
+
+
+                # 4. Query the Numeric Values - Query command (ALL CAPS)
+                print("Querying measurement results...")
+                ser.write(":NUMERIC:NORMAL:VALUE?\n".encode())
+                response = ser.readline().decode().strip()
+
+                if response:
+                    try:
+                        values = response.split(",")
+                        if len(values) >= 4:
+                            peak_voltage = float(values[0]) # Item 1: UPPeak
+                            current = float(values[1])      # Item 2: I
+                            instant_power = float(values[2])# Item 3: P (instantaneous)
+                            watt_hours = float(values[3])   # Item 4: WH (Total Watt-Hours)
+
+                            # 5. Calculate Average Power over the interval
+                            interval_hours = integration_interval_seconds / 3600.0
+                            if interval_hours > 0:
+                                average_power = watt_hours / interval_hours
+                            else:
+                                average_power = 0
+
+                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                            # Print to console
+                            print(f"{timestamp} - Interval Avg P: {average_power:.4f} W (from {watt_hours:.6f} Wh)")
+                            print(f"             End V+pk: {peak_voltage:.4f} V, End I: {current:.4f} A, End Inst P: {instant_power:.4f} W")
+
+                            # Write data row to CSV
+                            writer.writerow([
+                                timestamp,
+                                f"{average_power:.4f}",
+                                f"{watt_hours:.6f}",
+                                f"{peak_voltage:.4f}",
+                                f"{current:.4f}",
+                                f"{instant_power:.4f}"
+                            ])
+                            csvfile.flush()
+
+                        else:
+                            print(f"Warning: Received unexpected number of values: {len(values)}. Response: '{response}'")
+
+                    except (ValueError, IndexError) as e:
+                        print(f"Error parsing response: '{response}'. Error: {e}")
+                    except Exception as e:
+                         print(f"An unexpected error occurred during data processing/writing: {e}")
+                else:
+                    print("Warning: No measurement response received after integration.")
+
+            except serial.SerialException as e:
+                print(f"\nSerial communication error during loop: {e}")
+                print("Exiting measurement loop due to serial error.")
+                break
+            except IOError as e:
+                 print(f"\nError writing to CSV file '{output_csv_file}': {e}")
+                 print("Exiting measurement loop due to file error.")
+                 break
+            except TimeoutError as e:
+                 print(f"\nTimeout Error: {e}")
+                 print("Exiting measurement loop.")
+                 break
+            except Exception as e:
+                print(f"\nAn unexpected error occurred in the integration loop: {e}")
+                break
+
+# --- Cleanup ---
+except KeyboardInterrupt:
+    print("\nCtrl+C detected. Stopping.")
+except IOError as e:
+    print(f"Fatal Error: Could not open or write to CSV file '{output_csv_file}': {e}")
+finally:
+    if ser and ser.is_open:
+        try:
+            print("\nAttempting to stop integrator (if running)...")
+            # Send STOP command (mixed case)
+            ser.write(":INTegrate:STOP\n".encode())
+            time.sleep(0.1)
+        except Exception as stop_e:
+            print(f"Could not send stop command: {stop_e}")
+        print("Closing serial port.")
+        ser.close()
+    print("Script finished.")
