@@ -1,0 +1,223 @@
+Okay, that's a crucial detail! You're right, the standard U function often defaults to DC or RMS depending on the instrument mode, whereas UPPeak specifically gives you the positive peak voltage, which is often more relevant for characterizing AC waveforms, especially non-sinusoidal ones like from a PWM controller.
+
+The manual snippet shows exactly how to control which measurement function is assigned to which position in the list returned by :NUMeric:NORMal:VALue?.
+
+Here's the strategy:
+
+We need to explicitly tell the instrument to assign UPPeak to item position 1, I to position 2, and P to position 3.
+
+We will use the :NUMeric:NORMal:ITEM<x> <Function> command for this.
+
+We still need to make sure that :NUMeric:NORMal:NUMBer is set to 3, so that :NUMeric:NORMal:VALue? returns exactly these three items.
+
+We need to update the CSV header and the print statements to reflect that the first value is now Peak Voltage (V+pk).
+
+Here is the modified Python script incorporating these changes:
+
+import serial
+import time
+import csv
+import os # Import os module to check file existence easily
+
+# --- Configuration ---
+port = "COM3"
+baud_rate = 115200
+averaging_count = 16  # Averaging level (1, 2, 4, 8, 16, 32, 64)
+output_csv_file = "power_data_averaged_peakV.csv" # Updated filename
+
+# --- Initialize Serial Connection Variable ---
+ser = None
+
+# --- Connect and Configure Instrument ---
+try:
+    print(f"Attempting to connect to {port} at {baud_rate} baud...")
+    ser = serial.Serial(port, baud_rate, timeout=1)
+    print(f"Connected successfully to {port}.")
+
+    # Send *IDN? to verify connection and wake up instrument
+    ser.write("*IDN?\n".encode())
+    time.sleep(0.2)
+    idn_response = ser.readline().decode().strip()
+    if idn_response:
+        print(f"Instrument ID: {idn_response}")
+    else:
+        print("Warning: No response to *IDN?. Check connection/instrument state.")
+        # Consider exiting if IDN fails: raise Exception("Failed to get IDN response")
+
+    # --- NEW: Explicitly define the items to be returned ---
+    # We want Item 1 = UPPeak, Item 2 = I, Item 3 = P
+    # Using mixed case for set commands based on previous observations
+    print("Setting measurement items: 1=UPPeak, 2=I, 3=P...")
+    ser.write(":NUMeric:NORMal:ITEM1 UPPeak\n".encode()) # Set Item 1 to Positive Peak Voltage
+    time.sleep(0.2) # Allow time for processing
+    ser.write(":NUMeric:NORMal:ITEM2 I\n".encode())      # Set Item 2 to Current
+    time.sleep(0.2)
+    ser.write(":NUMeric:NORMal:ITEM3 P\n".encode())      # Set Item 3 to Active Power
+    time.sleep(0.2)
+
+    # Optional: Query items to confirm (using ALL CAPS for query)
+    print("Querying item settings for confirmation...")
+    ser.write(":NUMERIC:NORMAL:ITEM1?\n".encode())
+    time.sleep(0.1)
+    item1_resp = ser.readline().decode().strip()
+    print(f"Confirmation item 1: '{item1_resp}' (Expected :NUM:NORM:ITEM1 UPPE)") # Note: Instrument might abbreviate response
+    ser.write(":NUMERIC:NORMAL:ITEM2?\n".encode())
+    time.sleep(0.1)
+    item2_resp = ser.readline().decode().strip()
+    print(f"Confirmation item 2: '{item2_resp}' (Expected :NUM:NORM:ITEM2 I)")
+    ser.write(":NUMERIC:NORMAL:ITEM3?\n".encode())
+    time.sleep(0.1)
+    item3_resp = ser.readline().decode().strip()
+    print(f"Confirmation item 3: '{item3_resp}' (Expected :NUM:NORM:ITEM3 P)")
+    # --- End NEW section ---
+
+
+    # Now, manage the *number* of items returned (should be 3)
+    print("Checking/Setting number of items to return to 3...")
+    ser.write(":NUMERIC:NORMAL:NUMBER?\n".encode()) # Query first
+    time.sleep(0.1)
+    number_response_raw = ser.readline().decode().strip()
+    print(f"Response for NUMBER query: '{number_response_raw}'")
+    number_response_val = -1
+    if number_response_raw:
+        try:
+            number_response_val = int(number_response_raw.split()[-1])
+            print(f"Current number of items reported: {number_response_val}")
+        except (IndexError, ValueError):
+            print(f"Could not parse number of items from response: '{number_response_raw}'")
+    else:
+        print("Warning: No response received for :NUMERIC:NORMAL:NUMBER? query.")
+
+    # Set number of items if not already 3
+    if number_response_val != 3:
+        print("Setting number of items to 3...")
+        ser.write(":NUMeric:NORMal:NUMBer 3\n".encode()) # Set command
+        time.sleep(0.2)
+        # Confirm the change
+        ser.write(":NUMERIC:NORMAL:NUMBER?\n".encode()) # Query again
+        time.sleep(0.1)
+        confirm_response = ser.readline().decode().strip()
+        print(f"Confirmation response after setting NUMBER: '{confirm_response}'")
+    else:
+        print("Number of items is already 3.")
+
+
+    # Set Averaging Count (using mixed case for set command)
+    print(f"Setting averaging count to: {averaging_count}")
+    ser.write(f":MEASure:AVERaging:COUNt {averaging_count}\n".encode())
+    time.sleep(0.2)
+
+    # Confirm the averaging setting (using ALL CAPS for query)
+    ser.write(":MEASURE:AVERAGING:COUNT?\n".encode())
+    time.sleep(0.1)
+    avg_response = ser.readline().decode().strip()
+    if avg_response:
+        print(f"Averaging count confirmation response: '{avg_response}'")
+    else:
+         print("Warning: No response received for :MEASURE:AVERAGING:COUNT? query.")
+
+
+except serial.SerialException as e:
+    print(f"Fatal Error: Serial communication error during configuration: {e}")
+    if ser and ser.is_open:
+        ser.close()
+    exit() # Exit if configuration fails
+except Exception as e:
+    print(f"Fatal Error: An unexpected error occurred during configuration: {e}")
+    if ser and ser.is_open:
+        ser.close()
+    exit() # Exit if configuration fails
+
+
+# --- Measurement Loop and CSV Logging ---
+print(f"\nStarting measurement loop. Logging data to '{output_csv_file}'...")
+
+try:
+    with open(output_csv_file, "a", newline='') as csvfile:
+        writer = csv.writer(csvfile)
+
+        file_is_empty = os.path.getsize(output_csv_file) == 0 if os.path.exists(output_csv_file) else True
+
+        if file_is_empty:
+            print("CSV file is new or empty. Writing header.")
+            # --- UPDATED CSV HEADER ---
+            writer.writerow(["Timestamp", "Avg Peak Voltage (V+pk)", "Avg Current (A)", "Avg Power (W)"])
+            csvfile.flush()
+
+        while True:
+            try:
+                # Query measurements (Items 1, 2, 3 are now UPPeak, I, P)
+                ser.write(":NUMERIC:NORMAL:VALUE?\n".encode()) # Query is ALL CAPS
+                response = ser.readline().decode().strip()
+
+                if response:
+                    try:
+                        values = response.split(",")
+                        if len(values) >= 3:
+                            # Parse the values
+                            peak_voltage = float(values[0]) # Value 1 is now UPPeak
+                            current = float(values[1])      # Value 2 is I
+                            power = float(values[2])        # Value 3 is P
+                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                            # --- UPDATED PRINT STATEMENT ---
+                            print(f"{timestamp} - Avg V+pk: {peak_voltage:.4f} V, Avg I: {current:.4f} A, Avg P: {power:.4f} W")
+
+                            # Write data row to CSV (using updated labels implicitly via header)
+                            writer.writerow([timestamp, peak_voltage, current, power])
+                            csvfile.flush()
+
+                        else:
+                            print(f"Warning: Received unexpected number of values: {len(values)}. Response: '{response}'")
+
+                    except (ValueError, IndexError) as e:
+                        print(f"Error parsing response: '{response}'. Error: {e}")
+                    except Exception as e:
+                         print(f"An unexpected error occurred during data processing/writing: {e}")
+
+                else:
+                    print("Warning: No measurement response received from instrument in this cycle.")
+
+                time.sleep(1) # Poll every second
+
+            except serial.SerialException as e:
+                print(f"\nSerial communication error during loop: {e}")
+                print("Exiting measurement loop due to serial error.")
+                break
+            except IOError as e:
+                 print(f"\nError writing to CSV file '{output_csv_file}': {e}")
+                 print("Exiting measurement loop due to file error.")
+                 break
+            except Exception as e:
+                print(f"\nAn unexpected error occurred in the measurement loop: {e}")
+                break
+
+# --- Cleanup ---
+except KeyboardInterrupt:
+    print("\nCtrl+C detected. Stopping data logging.")
+except IOError as e:
+    print(f"Fatal Error: Could not open or write to CSV file '{output_csv_file}': {e}")
+finally:
+    if ser and ser.is_open:
+        print("Closing serial port.")
+        ser.close()
+    print("Script finished.")
+
+
+Key Changes:
+
+Set Items Explicitly: Added a new block in the configuration section that sends :NUMeric:NORMal:ITEM1 UPPeak, :NUMeric:NORMal:ITEM2 I, and :NUMeric:NORMal:ITEM3 P.
+
+Optional Confirmation Queries: Added queries for ITEM1, ITEM2, ITEM3 to check if the settings were accepted (useful for debugging). Note that the instrument might respond with abbreviations like UPPE for UPPeak.
+
+Number Check Refined: Made the check for :NUMeric:NORMal:NUMBer more robust, ensuring it's explicitly set to 3 after defining the items, just in case defining items changes the number count.
+
+CSV Filename: Changed to power_data_averaged_peakV.csv.
+
+CSV Header Updated: Changed the header for the first measurement column to "Avg Peak Voltage (V+pk)".
+
+Print Statement Updated: Changed the label in the print statement to "Avg V+pk:".
+
+Parsing: Renamed the variable voltage to peak_voltage when parsing the response for clarity, although this is optional.
+
+Now, the first value returned by the instrument and logged/printed will be the averaged Positive Peak Voltage (UPPeak), while the second and third values remain Current (I) and Active Power (P).
